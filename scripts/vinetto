@@ -1,4 +1,4 @@
-#!/usr/local/bin/python
+#!/usr/bin/python
 # -*- coding: UTF-8 -*-
 """
 -----------------------------------------------------------------------------
@@ -32,15 +32,22 @@ __author__ = 'Michel Roukine'
 import sys
 import os
 import StringIO
-import md5
-import vinreport
+try:
+    # Python >= 2.5
+    from hashlib import md5
+except:
+    # Python < 2.5
+    import md5
+from vinetto import vinreport
 
 from optparse import OptionParser
-from struct  import unpack
+from struct import unpack
 from binascii import unhexlify
-from time    import ctime
-from vinutils import addCatEntry, nbCatEnt, nbTNstr, TNfname, catIndxOutOfSeq, \
-                     tnStreamOutOfSeq, addTNStream, extractStats
+from time import ctime
+from vinetto.vinutils import addCatEntry, nbCatEnt, nbTNstr, TNfname, \
+                             catIndxOutOfSeq, tnStreamOutOfSeq, addTNStream, \
+                             extractStats
+from pkg_resources import resource_filename 
 
 PPS_TYPES = ["undefined", "storage", "stream", "undefined", "undefined", "root"]
 EOI = unhexlify('ffd9')
@@ -157,14 +164,19 @@ if outputdir != None :
         print >> sys.stderr, "             Vinetto will only extract Type 2 thumbnails."
         print >> sys.stderr, ""   
  
-    header       = open("/usr/share/vinetto/header","rb").read()
-    quantization = open("/usr/share/vinetto/quantization","rb").read()
-    huffman      = open("/usr/share/vinetto/huffman","rb").read()
+    header = open(resource_filename('vinetto', 'data/header'), "rb").read()
+    quantization = open(resource_filename('vinetto', 'data/quantization'), "rb").read()
+    huffman = open(resource_filename('vinetto', 'data/huffman'), "rb").read()
  
     if htmlrep == True:
         report = vinreport.HtRep(tDBfname, outputdir, getencodings(), __version__ + " (r" + \
                                  __revision__[11:-2] +")")
-        md5tDB = md5.new(thumbsDB).hexdigest()
+        try:
+            # Python >= 2.5
+            md5tDB = md5(thumbsDB).hexdigest()
+        except:
+            # Python < 2.5
+            md5tDB = md5.new(thumbsDB).hexdigest()
         report.SetFileSection(longueur, md5tDB)
 
 # -----------------------------------------------------------------------------

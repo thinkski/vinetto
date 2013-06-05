@@ -37,7 +37,8 @@ IMGTAG = "<IMG SRC=\"./__TNFNAME__.jpg\" ALT=\"__TNNAME__\">"
 
 from time import time, ctime
 from os.path import dirname, basename, abspath, getmtime
-from vinutils import getCatEntry       
+from vinetto.vinutils import getCatEntry       
+from pkg_resources import resource_filename
 
 
 class Report:
@@ -59,8 +60,7 @@ class HtRep(Report):
         self.rownumber = 0
         separatorID = 0
         
-        for ligne in open("/usr/share/vinetto/HtRepTemplate.html",
-                          "r").readlines():
+        for ligne in open(resource_filename('vinetto', 'data/HtRepTemplate.html'), "r").readlines():
             if ligne.find("__CHARSET__") > 0:
                 ligne = ligne.replace("__CHARSET__", charset)
             if ligne.find("__ITS__") >= 0:
