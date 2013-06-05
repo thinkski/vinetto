@@ -1,0 +1,388 @@
+#!/usr/local/bin/python
+# -*- coding: UTF-8 -*-
+"""
+-----------------------------------------------------------------------------
+
+ Vinetto : a forensics tool to examine Thumbs.db files
+ Copyright (C) 2005, 2006 by Michel Roukine
+ 
+This file is part of Vinetto.
+ 
+ Vinetto is free software; you can redistribute it and/or
+ modify it under the terms of the GNU General Public License as published
+ by the Free Software Foundation; either version 2 of the License, or (at
+ your option) any later version.
+ 
+ Vinetto is distributed in the hope that it will be
+ useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ General Public License for more details.
+ 
+ You should have received a copy of the GNU General Public License along
+ with the vinetto package; if not, write to the Free Software
+ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ 
+-----------------------------------------------------------------------------
+"""
+
+__revision__ = "$Revision: 59 $"
+__version__ = "0.06"
+__author__ = 'Michel Roukine'
+
+import sys
+import os
+import StringIO
+import md5
+import vinreport
+
+from optparse import OptionParser
+from struct  import unpack
+from binascii import unhexlify
+from time    import ctime
+from vinutils import addCatEntry, nbCatEnt, nbTNstr, TNfname, catIndxOutOfSeq, \
+                     tnStreamOutOfSeq, addTNStream, extractStats
+
+PPS_TYPES = ["undefined", "storage", "stream", "undefined", "undefined", "root"]
+EOI = unhexlify('ffd9')
+HEADER1 = unhexlify('0c00')
+PIL = ""
+NUMBERED_THUMBS_DIR = ".thumbs"
+
+
+def getargs():
+    """Return arguments passed to vinetto on the command line.  """
+    verstr = "%prog " + __version__ + " (r" + __revision__[11:-2] +")\n\n" +\
+             "Copyright (C) 2005-2006 Michel Roukine.\n" + \
+             "Vinetto is open source software," + \
+             " see http://vinetto.sourceforge.net/"
+    parser = OptionParser(usage="%prog [OPTIONS] [-s] [-U] [-o DIR] file", version=verstr)
+    parser.add_option("-o", dest="outputdir",
+                      help="write thumbnails to DIR", metavar="DIR")
+    parser.set_defaults(htmlrep=False)
+    parser.add_option("-H", action="store_true", dest="htmlrep",
+                      help="write html report to DIR")
+    parser.set_defaults(encoding=False)
+    parser.add_option("-U", action="store_true", dest="encoding",
+                      help="use utf8 encodings")
+    parser.set_defaults(symlinks=False)
+    parser.add_option("-s", action="store_true", dest="symlinks",
+                      help="create symlink of the image realname to the numbered name in DIR/.thumbs")
+    opts, pargs = parser.parse_args()
+    
+    if len(pargs) != 1:
+        parser.error("incorrect number of arguments")
+        
+    if (opts.outputdir == None) and (opts.htmlrep == True):
+        parser.error("-H option requires -o with a directory name")
+    os.system("mkdir " + opts.outputdir + "/" + NUMBERED_THUMBS_DIR)
+    return (pargs[0], opts.outputdir, opts.htmlrep, opts.encoding, opts.symlinks) 
+
+
+def getencodings():
+    """What encoding we use?"""
+    if utf8encoding: 
+        fileencoding = 'utf8'
+    else:
+        fileencoding = 'iso-8859-1'
+    return fileencoding
+
+def encodefilename(originame):
+    """Convert filename to the global encoding. """
+    TNname = unicode(originame,
+                   'utf-16-le').encode(getencodings(), 'replace')
+    return TNname
+
+def conv2pytime (win32filetime):
+    """Convert win32 timestamp to python time.  """
+    SECS_BETWEEN_EPOCHS = 11644473600
+    SECS_TO_100NS = 10000000
+
+    if win32filetime == 0:
+        return 0
+    else:
+        return (win32filetime / SECS_TO_100NS) - SECS_BETWEEN_EPOCHS
+
+
+def nextBlock (TDB, Table, indx):
+    """Return next block.  """
+    iFAT = indx / 128  # FAT block number to search in
+    iSECT = indx % 128 # SECTor to search in the FAT block
+    offst = Table [iFAT] * 512 + 0x200 + iSECT*4
+    return unpack("<l", TDB[offst:offst+4])[0]
+
+# Beginning ...   
+tDBfname, outputdir, htmlrep, utf8encoding, symlinks = getargs()
+
+# Testing file and DIR parameters
+if not os.access(tDBfname, os.F_OK):
+    print >> sys.stderr, "Error: ", tDBfname, "does not exist"
+    sys.exit(1)
+elif  not os.path.isfile(tDBfname):
+    print >> sys.stderr, "Error: ", tDBfname, "not a file"
+    sys.exit(1)
+elif  not os.access(tDBfname, os.R_OK):
+    print >> sys.stderr, "Error: ", tDBfname, "not readable"
+    sys.exit(1)
+
+# Opening Thumbs.db file
+thumbsDB = open(tDBfname,"rb").read()
+longueur = len(thumbsDB)
+if (longueur % 512 ) != 0:
+    print >> sys.stderr, " ** Warning: length " + tDBfname + " : " \
+                        + str(longueur) + ", non multiple 512"
+
+# Initializing extraction and optional html report
+if outputdir != None :
+    if not os.path.exists(outputdir):
+        try :
+            os.mkdir(outputdir)
+            print 'Note: ', outputdir, ' was created'
+        except EnvironmentError, e:
+            print >> sys.stderr, "Error creating", outputdir
+            sys.exit(1)
+    elif not os.path.isdir(outputdir):
+        print >> sys.stderr, 'Error: ', outputdir, ' is not a directory'
+        sys.exit(1)
+    elif not os.access(outputdir, os.W_OK):
+        print >> sys.stderr, 'Error: ', outputdir, ' not writable'
+        sys.exit(1)
+    outputdir += "/"
+    
+    try:
+        import Image
+        PIL = "imported"
+    except ImportError, e:
+        print >> sys.stderr, ""
+        print >> sys.stderr, " ** Warning: Cannot find \"Image\" module."
+        print >> sys.stderr, "             Vinetto will only extract Type 2 thumbnails."
+        print >> sys.stderr, ""   
+ 
+    header       = open("/usr/share/vinetto/header","rb").read()
+    quantization = open("/usr/share/vinetto/quantization","rb").read()
+    huffman      = open("/usr/share/vinetto/huffman","rb").read()
+ 
+    if htmlrep == True:
+        report = vinreport.HtRep(tDBfname, outputdir, getencodings(), __version__ + " (r" + \
+                                 __revision__[11:-2] +")")
+        md5tDB = md5.new(thumbsDB).hexdigest()
+        report.SetFileSection(longueur, md5tDB)
+
+# -----------------------------------------------------------------------------
+# Analyzing header block ...
+
+if "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" != thumbsDB[0:8] :
+    print >> sys.stderr, " *** Error  " + tDBfname + ": header signature error "
+    sys.exit(8)
+
+nbFATblocks = unpack("<l", thumbsDB[0x2c:0x2c+4])[0]
+
+REfirstBlock = unpack("<l", thumbsDB[0x30:0x30+4])[0] #Root directory 1st block
+
+firstMiniFATblock = unpack("<l", thumbsDB[0x3c:0x3c+4])[0]
+
+FATblocks = []
+for i in range(nbFATblocks):
+    offset = 0x4c + i*4
+    FATblocks.append(unpack("<l", thumbsDB[offset:offset + 4])[0])
+
+# -----------------------------------------------------------------------------
+# Analyzing Root Entry directory ...
+
+currentBlock = REfirstBlock
+
+i = firstMiniFATblock
+MiniFATblocks = []
+while i != -2:
+    MiniFATblocks.append(i)
+    i = nextBlock (thumbsDB, FATblocks, i)
+
+offset = 0x200 + currentBlock * 0x200
+firstMiniFATstreamBlock = unpack("<l", thumbsDB[offset+0x74:offset+0x78])[0]
+
+i = firstMiniFATstreamBlock
+MiniFATstreamBlocks = []
+while i != -2:
+    MiniFATstreamBlocks.append(i)
+    i = nextBlock (thumbsDB, FATblocks, i)
+
+SID = 0
+
+while currentBlock != -2:
+    offset = 0x200 + currentBlock * 0x200
+    for i in range (offset, offset+0x200, 0x80):
+        pps_rawname     = unpack("64s", thumbsDB[i     :i+0x40])[0]
+        pps_sizeofname  = unpack("<h",  thumbsDB[i+0x40:i+0x42])[0]
+        pps_type        = unpack("b",   thumbsDB[i+0x42:i+0x43])[0]
+        pps_ts1         = unpack("<Q",  thumbsDB[i+0x64:i+0x6c])[0]
+        pps_ts2         = unpack("<Q",  thumbsDB[i+0x6c:i+0x74])[0]
+        pps_sb          = unpack("<l",  thumbsDB[i+0x74:i+0x78])[0]
+        pps_size        = unpack("<l",  thumbsDB[i+0x78:i+0x7c])[0]
+        
+        if pps_type == 2: # stream files extraction
+            rawname = unicode(pps_rawname,"utf-16-le")[0:(pps_sizeofname/2 - 1)]
+            #SIDstr  = "%04i" % SID
+            SIDstr = rawname [::-1]
+            if len(SIDstr) < 4:
+                SIDstr = "%04i" % int(SIDstr)
+            bytesToWrite = pps_size
+
+            if pps_size >= 4096 : # stream located in the FAT
+                sr = ""
+                currentStreamBlock = pps_sb
+                while currentStreamBlock != -2:
+                    sOffset = 0x200 + currentStreamBlock * 0x200
+                    if bytesToWrite >= 512:
+                        sr = sr + thumbsDB[sOffset:sOffset + 512] 
+                    else:
+                        sr = sr + thumbsDB[sOffset:sOffset + bytesToWrite] 
+                    bytesToWrite = bytesToWrite - 512
+                    currentStreamBlock = nextBlock (thumbsDB, FATblocks,
+                                                    currentStreamBlock)
+
+            else:                # stream located in the MiniFAT
+                sr = ""
+                currentStreamMiniBlock = pps_sb
+                while currentStreamMiniBlock != -2 :
+                    # computing offset of the miniBlock to copy
+                    # 1 : which block of the miniFATstream ?
+                    nb = currentStreamMiniBlock / 8 
+                    # 2 : where is this block ?
+                    bl = MiniFATstreamBlocks[nb]   
+                    # 3 : which offset from the start of block ?
+                    ioffset = (currentStreamMiniBlock % 8) * 64 
+
+                    sOffset = 0x200 + bl*0x200 + ioffset
+
+                    if bytesToWrite >= 64:
+                        sr = sr + thumbsDB[sOffset:sOffset + 64 ] 
+                    else:
+                        sr = sr + thumbsDB[sOffset:sOffset + bytesToWrite] 
+                    bytesToWrite = bytesToWrite - 64
+                    # computing next currentStreamMiniBlock
+                    currentStreamMiniBlock = nextBlock (thumbsDB, 
+                                                        MiniFATblocks, 
+                                                        currentStreamMiniBlock)
+
+            # extraction stream processing ... ---------------------------------
+
+            longueur = len(sr)
+
+            # is this a Catalog ?
+            if rawname == "Catalog" :
+                # -------------------------------------------------------------
+                # Skipping catalog header block ...
+                
+                recordLen = unpack("<h", sr[0:2])[0]
+                indcat = recordLen
+                SID = SID - 1
+                
+                # -------------------------------------------------------------
+                # Analyzing Catalog entries ...
+                
+                while indcat < longueur :
+                    recordLen   = unpack("<h", sr[indcat   :indcat+2])[0]
+                    num         = unpack("<l", sr[indcat+4 :indcat+8])[0]
+                    timestamp   = unpack("<Q", sr[indcat+8 :indcat+16])[0]
+                    nameLen     = recordLen - 0x14
+
+                    originame   = sr[indcat+16 :indcat+16+nameLen]
+                    TNid = "%04i" % num
+                    TNtimestamp = ctime(conv2pytime(timestamp))
+                    TNname = encodefilename(originame)
+                    if symlinks:
+                        os.system( "ln -fs " + NUMBERED_THUMBS_DIR + "/" + TNid + ".jpg " + "\"" + \
+                                    outputdir + "/" + TNname + "\"" )
+                    print  " " + TNid, " ", TNtimestamp, " ", TNname
+                    addCatEntry(num, TNtimestamp, TNname)
+                    indcat = indcat + recordLen
+       
+            else :
+    
+                # is EOI = 0xffd9 ?
+                if sr[longueur-2:longueur] != EOI:
+                    print >> sys.stderr, " *** Err: missing EOI in stream", SID
+                    sys.exit(2)
+                # --------------------------- header 1 ------------------------
+                # is first header OK ?
+                if sr[0:2] != HEADER1:
+                    print >> sys.stderr, \
+                          " *** Err: unrecognized header in stream", SID
+                    sys.exit(3)
+    
+                # is length OK ?
+                if  unpack("<H", sr[8:10])[0] != (longueur - 0x0c) :
+                    print >> sys.stderr, " *** Err: length error in stream", SID
+                    sys.exit(4)
+                # --------------------------- header 2 ------------------------
+                # is it a type 2 thumbnail ? (full jpeg)
+                if  sr[0x0c:0x10] == "\xff\xd8\xff\xe0" :
+                    if outputdir != None :
+                        open(outputdir + "/" + NUMBERED_THUMBS_DIR + "/" + TNfname(SIDstr, "2") + ".jpg", \
+                             "wb").write(sr[0x0c:])                                   
+                elif  unpack("<L",sr[0x0c:0x10])[0] == 1 :
+                    # is second header OK ?
+                    if  unpack("<H", sr[0x0c+4:0x0c+6])[0] != (longueur - 
+                                                              0x0c - 0x10):
+                        print >> sys.stderr, \
+                              " *** Err : length(2) error in stream", SID
+                        sys.exit(5)
+                    # Type 1 TN processing ...
+                    if (PIL == "imported") and (outputdir != None):                                
+                        type1sr = header[:0x14]
+                        type1sr = type1sr + quantization
+                        type1sr = type1sr + sr[0x1e:0x34]
+                        type1sr = type1sr + huffman
+                        type1sr = type1sr + sr[0x34:]
+
+                        im = Image.open(StringIO.StringIO(type1sr))
+                        r, g, b, a = im.split()
+                        im = Image.merge("RGB", (b, g, r))
+                        im = im.transpose(Image.FLIP_TOP_BOTTOM)
+                        im.save(outputdir + TNfname(SIDstr, "1") + ".jpg", \
+                                "JPEG", quality=100)
+                    elif outputdir != None: # Cannot extract : PIL not imported
+                        addTNStream(int(SIDstr), "1", "")
+                else :
+                    print >> sys.stderr, \
+                          " *** Err : header (2) error in stream", SID
+                    sys.exit(6)
+
+            # -----------------------------------------------------------------
+
+        elif pps_type == 5: # Root Entry
+            REtimestamp = pps_ts2
+            print
+            print " Root Entry modify timestamp :", \
+                  ctime(conv2pytime(REtimestamp))
+            if htmlrep == True:
+                report.SetREtst (ctime(conv2pytime(REtimestamp)))
+            print
+            print " ------------------------------------------------------"
+            print
+            
+        SID = SID + 1
+
+    currentBlock = nextBlock(thumbsDB, FATblocks, currentBlock)
+
+print
+print " ------------------------------------------------------"
+print
+
+if catIndxOutOfSeq() == True:
+    print >> sys.stderr, " * Info: ", tDBfname, "Catalog",\
+                         " index number out of usual sequence"
+
+if tnStreamOutOfSeq() == True:
+    print >> sys.stderr, " * Info: ", tDBfname, \
+                         "thumbnail stream index number out of usual sequence"
+
+if  (outputdir != None) and (nbCatEnt() != nbTNstr()):
+    print >> sys.stderr, " ** Warning: ", tDBfname, " -- number of extracted ", \
+                         "thumbnails does not match number of Catalog entries"
+
+statstring = extractStats(outputdir)
+print statstring
+
+if htmlrep == True:
+    report.flush(statstring)
+    
